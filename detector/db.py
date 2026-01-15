@@ -2,6 +2,7 @@
 Database Module.
 
 Handles PostgreSQL connection and operations for recording metadata.
+Schema is managed by the db-migrate service.
 """
 
 import time
@@ -9,7 +10,6 @@ from typing import Optional
 from datetime import datetime
 
 import psycopg2
-from psycopg2 import sql
 
 from config import config
 
@@ -37,39 +37,22 @@ def get_connection() -> psycopg2.extensions.connection:
 
 def init_db(max_retries: int = 10, retry_delay: int = 3) -> bool:
     """
-    Initialize database schema (create tables if they don't exist).
+    Initialize database connection (schema is managed by db-migrate service).
     
     Args:
         max_retries: Maximum connection attempts
         retry_delay: Seconds between retries
         
     Returns:
-        True if initialization succeeded
+        True if connection succeeded
     """
     for attempt in range(max_retries):
         try:
             conn = get_connection()
+            # Just verify the connection works
             with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS recordings (
-                        id SERIAL PRIMARY KEY,
-                        stream_id VARCHAR(255) NOT NULL,
-                        filename VARCHAR(255) NOT NULL,
-                        filepath VARCHAR(512) NOT NULL,
-                        recorded_at TIMESTAMP NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                # Index for efficient queries by stream and date
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_recordings_stream_id 
-                    ON recordings(stream_id)
-                """)
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_recordings_recorded_at 
-                    ON recordings(recorded_at)
-                """)
-            print("[INFO] Database initialized successfully", flush=True)
+                cur.execute("SELECT 1")
+            print("[INFO] Database connection established", flush=True)
             return True
             
         except psycopg2.OperationalError as e:
@@ -80,7 +63,7 @@ def init_db(max_retries: int = 10, retry_delay: int = 3) -> bool:
                 print("[ERROR] Failed to connect to database after retries", flush=True)
                 return False
         except Exception as e:
-            print(f"[ERROR] Database initialization failed: {e}", flush=True)
+            print(f"[ERROR] Database connection failed: {e}", flush=True)
             return False
     
     return False
@@ -112,6 +95,121 @@ def insert_recording(stream_id: str, filename: str, filepath: str, recorded_at: 
         return True
     except Exception as e:
         print(f"[WARN] Failed to insert recording: {e}", flush=True)
+        return False
+
+
+def upsert_camera(
+    stream_id: str,
+    name: Optional[str] = None,
+    source_type: Optional[str] = None,
+    source_url: Optional[str] = None,
+    ready: bool = False,
+    bytes_received: int = 0,
+    bytes_sent: int = 0
+) -> bool:
+    """
+    Insert or update a camera record.
+    
+    Args:
+        stream_id: Unique identifier for the camera stream
+        name: Optional display name for the camera
+        source_type: Type of source (e.g., "rtspSource", "webrtcSource")
+        source_url: URL of the source stream
+        ready: Whether the stream is ready/active
+        bytes_received: Total bytes received
+        bytes_sent: Total bytes sent
+        
+    Returns:
+        True if upsert succeeded
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO cameras (stream_id, name, source_type, source_url, ready, bytes_received, bytes_sent, last_seen_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (stream_id) DO UPDATE SET
+                    name = COALESCE(EXCLUDED.name, cameras.name),
+                    source_type = COALESCE(EXCLUDED.source_type, cameras.source_type),
+                    source_url = COALESCE(EXCLUDED.source_url, cameras.source_url),
+                    ready = EXCLUDED.ready,
+                    bytes_received = EXCLUDED.bytes_received,
+                    bytes_sent = EXCLUDED.bytes_sent,
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (stream_id, name, source_type, source_url, ready, bytes_received, bytes_sent)
+            )
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to upsert camera: {e}", flush=True)
+        return False
+
+
+def update_camera_status(stream_id: str, ready: bool) -> bool:
+    """
+    Update the ready status of a camera.
+    
+    Args:
+        stream_id: The camera stream identifier
+        ready: Whether the stream is ready/active
+        
+    Returns:
+        True if update succeeded
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE cameras 
+                SET ready = %s, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE stream_id = %s
+                """,
+                (ready, stream_id)
+            )
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to update camera status: {e}", flush=True)
+        return False
+
+
+def mark_cameras_offline(active_stream_ids: list) -> bool:
+    """
+    Mark cameras as offline (ready=false) if they're not in the active list.
+    
+    Args:
+        active_stream_ids: List of currently active stream IDs
+        
+    Returns:
+        True if update succeeded
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            if active_stream_ids:
+                # Mark cameras not in the list as offline
+                cur.execute(
+                    """
+                    UPDATE cameras 
+                    SET ready = FALSE, updated_at = CURRENT_TIMESTAMP
+                    WHERE ready = TRUE AND stream_id != ALL(%s)
+                    """,
+                    (active_stream_ids,)
+                )
+            else:
+                # No active streams, mark all as offline
+                cur.execute(
+                    """
+                    UPDATE cameras 
+                    SET ready = FALSE, updated_at = CURRENT_TIMESTAMP
+                    WHERE ready = TRUE
+                    """
+                )
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to mark cameras offline: {e}", flush=True)
         return False
 
 

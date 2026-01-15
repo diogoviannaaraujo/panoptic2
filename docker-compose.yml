@@ -48,7 +48,7 @@ services:
       - /dev/shm:size=512M
     depends_on:
       - mediamtx
-      - db
+      - db-migrate
 
   api:
     build:
@@ -61,9 +61,15 @@ services:
       - ./recordings:/recordings
     environment:
       - RECORDINGS_DIR=/recordings
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=panoptic
+      - DB_USER=user
+      - DB_PASSWORD=password
     restart: unless-stopped
     depends_on:
       - detector
+      - db-migrate
 
   db:
     image: postgres:15-alpine
@@ -77,6 +83,20 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+
+  db-migrate:
+    build:
+      context: ./db
+      dockerfile: Dockerfile
+    container_name: db_migrate
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: panoptic
+    depends_on:
+      - db
+    restart: "no"
 
   vllm:
     build:

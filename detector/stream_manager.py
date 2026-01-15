@@ -25,7 +25,19 @@ import requests
 from pipeline import StreamPipeline
 from motion_detector import MotionEvent, default_motion_handler
 from config import config
-from db import init_db, insert_recording, close_connection
+from db import init_db, insert_recording, close_connection, upsert_camera, mark_cameras_offline
+
+
+@dataclass
+class CameraInfo:
+    """Represents camera info from MediaMTX API."""
+    stream_id: str
+    name: str
+    ready: bool
+    source_type: Optional[str] = None
+    source_url: Optional[str] = None
+    bytes_received: int = 0
+    bytes_sent: int = 0
 
 
 @dataclass
@@ -260,16 +272,19 @@ class StreamManager:
             flush=True
         )
 
-    def discover_streams(self) -> List[str]:
+    def discover_streams(self) -> List[CameraInfo]:
         """
         Discover available RTSP streams from MediaMTX API.
         
         Returns:
-            List of stream names/paths available on MediaMTX
+            List of CameraInfo objects for streams available on MediaMTX
         """
         # If manual streams are configured, use those instead
         if config.manual_streams:
-            return config.manual_streams
+            return [
+                CameraInfo(stream_id=s, name=s, ready=True)
+                for s in config.manual_streams
+            ]
         
         try:
             api_url = f"{config.mediamtx.api_url}/v3/paths/list"
@@ -277,20 +292,42 @@ class StreamManager:
             
             if response.status_code == 200:
                 data = response.json()
-                streams = []
+                cameras = []
                 
-                # Extract stream names from the API response
+                # Extract stream info from the API response
                 items = data.get("items", [])
                 for item in items:
                     name = item.get("name", "")
-                    # Only include streams that have active readers or sources
-                    if name and item.get("ready", False):
-                        streams.append(name)
+                    ready = item.get("ready", False)
+                    
+                    if not name:
+                        continue
+                    
+                    # Extract source info
+                    source = item.get("source", {})
+                    source_type = source.get("type") if source else None
+                    source_id = source.get("id", "") if source else ""
+                    
+                    # Get traffic stats
+                    bytes_received = item.get("bytesReceived", 0)
+                    bytes_sent = item.get("bytesSent", 0)
+                    
+                    camera = CameraInfo(
+                        stream_id=name,
+                        name=name,
+                        ready=ready,
+                        source_type=source_type,
+                        source_url=source_id,
+                        bytes_received=bytes_received,
+                        bytes_sent=bytes_sent
+                    )
+                    cameras.append(camera)
                 
                 if config.verbose:
-                    print(f"[DEBUG] Discovered {len(streams)} streams: {streams}")
+                    ready_streams = [c.stream_id for c in cameras if c.ready]
+                    print(f"[DEBUG] Discovered {len(cameras)} cameras, {len(ready_streams)} ready: {ready_streams}")
                 
-                return streams
+                return cameras
             else:
                 print(f"[WARN] MediaMTX API returned status {response.status_code}")
                 return []
@@ -328,20 +365,40 @@ class StreamManager:
         
         return pipeline
     
-    def _update_streams(self, discovered_streams: List[str]):
+    def _update_streams(self, discovered_cameras: List[CameraInfo]):
         """
-        Update pipelines based on discovered streams.
+        Update pipelines based on discovered cameras.
         
-        - Start pipelines for new streams
-        - Remove pipelines for streams that no longer exist
+        - Upsert all discovered cameras to database
+        - Start pipelines for new ready streams
+        - Remove pipelines for streams that are no longer ready
         """
+        # Build lookup of camera info by stream_id
+        camera_lookup = {c.stream_id: c for c in discovered_cameras}
+        ready_stream_ids = {c.stream_id for c in discovered_cameras if c.ready}
+        all_stream_ids = [c.stream_id for c in discovered_cameras]
+        
+        # Update all cameras in database (including non-ready ones)
+        for camera in discovered_cameras:
+            upsert_camera(
+                stream_id=camera.stream_id,
+                name=camera.name,
+                source_type=camera.source_type,
+                source_url=camera.source_url,
+                ready=camera.ready,
+                bytes_received=camera.bytes_received,
+                bytes_sent=camera.bytes_sent
+            )
+        
+        # Mark cameras not in the discovered list as offline
+        mark_cameras_offline(all_stream_ids)
+        
         with self._lock:
             current_streams = set(self._pipelines.keys())
-            new_streams = set(discovered_streams)
             
-            # Stop and remove pipelines for streams that disappeared
-            for stream_id in current_streams - new_streams:
-                print(f"[INFO] Stream {stream_id} no longer available, stopping pipeline")
+            # Stop and remove pipelines for streams that are no longer ready
+            for stream_id in current_streams - ready_stream_ids:
+                print(f"[INFO] Stream {stream_id} no longer ready, stopping pipeline")
                 self._pipelines[stream_id].stop()
                 del self._pipelines[stream_id]
                 # Clean up session state for removed streams
@@ -351,8 +408,8 @@ class StreamManager:
                     if stream_id in self._segment_history:
                         del self._segment_history[stream_id]
             
-            # Create pipelines for new streams
-            for stream_id in new_streams - current_streams:
+            # Create pipelines for new ready streams
+            for stream_id in ready_stream_ids - current_streams:
                 print(f"[INFO] New stream discovered: {stream_id}")
                 pipeline = self._create_pipeline(stream_id)
                 if pipeline:
@@ -388,10 +445,10 @@ class StreamManager:
         
         while self._running:
             try:
-                # Discover streams
-                streams = self.discover_streams()
-                if streams:
-                    self._update_streams(streams)
+                # Discover cameras and update DB/pipelines
+                cameras = self.discover_streams()
+                if cameras:
+                    self._update_streams(cameras)
                 
                 # Check pipeline health
                 self._check_pipeline_health()
@@ -540,6 +597,9 @@ class StreamManager:
                 print(f"[INFO] Stopping pipeline for {stream_id}")
                 pipeline.stop()
             self._pipelines.clear()
+        
+        # Mark all cameras as offline before shutting down
+        mark_cameras_offline([])
         
         # Close database connection
         close_connection()
