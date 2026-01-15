@@ -27,7 +27,7 @@ services:
       - MEDIAMTX_RTSP_PORT=8554
       - SEGMENT_OUTPUT_DIR=/dev/shm/segments
       - RECORDINGS_DIR=/recordings
-      - SEGMENT_DURATION=5
+      - SEGMENT_DURATION=10
       - MAX_SEGMENTS=20
       - PRE_ROLL_SECONDS=5
       - POST_ROLL_SECONDS=5
@@ -118,9 +118,12 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    # Qwen/Qwen3-VL-8B-Instruct-FP8 advertises a 262k context; on a 24GB GPU
-    # vLLM cannot allocate enough KV cache for that. Cap max context to fit.
-    # command is now in the Dockerfile
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
     restart: unless-stopped
 
   analyser:
@@ -133,12 +136,20 @@ services:
       VLLM_API_URL: http://vllm:8000/v1/chat/completions
       SERVER_PORT: 8080
       POLL_INTERVAL: 10
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: panoptic
+      DB_USER: user
+      DB_PASSWORD: password
     volumes:
       - ./recordings:/recordings
     ports:
       - "8080:8080"
     depends_on:
-      - vllm
+      vllm:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:

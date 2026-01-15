@@ -14,6 +14,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import uvicorn
 
+import db
+
 # Configuration
 RECORDINGS_DIR = os.getenv("RECORDINGS_DIR", "../recordings")
 VLLM_API_URL = os.getenv("VLLM_API_URL", "http://localhost:8000/v1/chat/completions")
@@ -91,22 +93,29 @@ def clean_json_string(content: str) -> str:
         return json_match.group(1).strip()
     return content.strip()
 
-def process_video(video_path: Path):
+def process_recording(recording: dict):
+    """Process a recording from the database."""
+    recording_id = recording["id"]
+    filepath = recording["filepath"]
+    filename = recording["filename"]
+    
     try:
-        relative_path = video_path.relative_to(abs_recordings_path)
-        # Use valid URL characters for path
-        video_url = f"http://{HOST_IP}:{SERVER_PORT}/recordings/{relative_path}"
+        # Build full path and URL
+        video_path = abs_recordings_path / filepath
+        video_url = f"http://{HOST_IP}:{SERVER_PORT}/recordings/{filepath}"
         
-        logger.info(f"Processing {video_path.name}...")
+        logger.info(f"Processing recording {recording_id}: {filename}...")
         logger.debug(f"Video URL: {video_url}")
         
         prompt = """
-        Analyze this video segment. Provide a structured analysis in JSON format.
+        Analyze this video segment of a security camera.
+        Provide a structured analysis in JSON format.
         The JSON object must strictly adhere to this schema:
         {
             "description": "A detailed description of the scene and events",
-            "danger": boolean, // true if there is any danger, threat, or suspicious activity
-            "danger_details": "Details about the danger if any, otherwise null or empty string"
+            "danger": boolean, // true if there is any danger, threat, or suspicious activity that may require attention
+            "danger_level": number, // the level of the danger between 0 and 10
+            "danger_details": "Details about the danger if any, otherwise empty string"
         }
         
         Ensure valid JSON output. Do not include any text outside the JSON object.
@@ -123,7 +132,7 @@ def process_video(video_path: Path):
                     ]
                 }
             ],
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "temperature": 0.1
         }
         
@@ -131,10 +140,14 @@ def process_video(video_path: Path):
         
         # Use session with retries for resilience
         session = create_session_with_retries(retries=3)
-        response = session.post(VLLM_API_URL, json=payload, timeout=300)  # Long timeout for video processing
+        response = session.post(VLLM_API_URL, json=payload, timeout=300)
         
         if response.status_code != 200:
             logger.error(f"vLLM API Error: {response.status_code} - {response.text}")
+            db.insert_analysis(
+                recording_id=recording_id,
+                error=f"vLLM API Error: {response.status_code}"
+            )
             return
 
         result = response.json()
@@ -144,21 +157,34 @@ def process_video(video_path: Path):
         cleaned_content = clean_json_string(content)
         try:
             data = json.loads(cleaned_content)
+            
+            # Insert successful analysis
+            db.insert_analysis(
+                recording_id=recording_id,
+                description=data.get("description"),
+                danger=data.get("danger", False),
+                danger_details=data.get("danger_details"),
+                raw_response=content
+            )
+            
+            logger.info(f"Successfully processed recording {recording_id}: {filename}")
+            logger.info(f"Result: {json.dumps(data, indent=2)}")
+            
         except json.JSONDecodeError:
             logger.error(f"Failed to parse JSON response: {content}")
-            # Save raw content just in case
-            data = {"raw_content": content, "error": "json_parse_error"}
-
-        # Save result to .json file
-        json_path = video_path.with_suffix('.json')
-        with open(json_path, 'w') as f:
-            json.dump(data, f, indent=2)
-            
-        logger.info(f"Successfully processed {video_path.name}")
-        logger.info(f"Result: {json.dumps(data, indent=2)}")
+            # Save with error flag
+            db.insert_analysis(
+                recording_id=recording_id,
+                raw_response=content,
+                error="json_parse_error"
+            )
         
     except Exception as e:
-        logger.error(f"Exception processing {video_path.name}: {e}")
+        logger.error(f"Exception processing recording {recording_id}: {e}")
+        db.insert_analysis(
+            recording_id=recording_id,
+            error=str(e)
+        )
 
 def wait_for_vllm(timeout: int = 300):
     """Wait for vLLM to be ready before starting."""
@@ -179,49 +205,36 @@ def wait_for_vllm(timeout: int = 300):
     logger.warning(f"vLLM did not become ready after {timeout} seconds, proceeding anyway...")
     return False
 
-def get_pending_files_by_camera() -> dict[str, list[Path]]:
-    """Get pending .ts files grouped by camera directory (round-robin fair processing)."""
-    pending_by_camera = {}
+def get_pending_by_camera() -> dict[str, list[dict]]:
+    """Get pending recordings grouped by camera (stream_id) for round-robin processing."""
+    pending = db.get_pending_recordings()
     
-    # Find all camera directories (first-level subdirectories like live_botafogo2_CAM4, etc.)
-    for camera_dir in abs_recordings_path.iterdir():
-        if not camera_dir.is_dir():
-            continue
-        
-        camera_name = camera_dir.name
-        pending_files = []
-        
-        # Find all .ts files in this camera's directory tree
-        for ts_file in camera_dir.rglob("*.ts"):
-            json_file = ts_file.with_suffix('.json')
-            if not json_file.exists():
-                pending_files.append(ts_file)
-        
-        if pending_files:
-            # Sort by modification time (oldest first) within each camera
-            pending_files.sort(key=os.path.getmtime)
-            pending_by_camera[camera_name] = pending_files
+    by_camera = {}
+    for rec in pending:
+        stream_id = rec["stream_id"]
+        if stream_id not in by_camera:
+            by_camera[stream_id] = []
+        by_camera[stream_id].append(rec)
     
-    return pending_by_camera
+    return by_camera
 
 def monitor_loop():
-    logger.info(f"Started monitoring {abs_recordings_path} for .ts files...")
+    logger.info("Started monitoring database for pending recordings...")
     while True:
         try:
-            # Get pending files grouped by camera
-            pending_by_camera = get_pending_files_by_camera()
+            # Get pending recordings grouped by camera
+            pending_by_camera = get_pending_by_camera()
             
             if not pending_by_camera:
-                logger.debug("No pending files to process")
+                logger.debug("No pending recordings to process")
                 time.sleep(POLL_INTERVAL)
                 continue
             
             # Log status
-            for camera, files in pending_by_camera.items():
-                logger.info(f"Camera {camera}: {len(files)} pending files")
+            for camera, recordings in pending_by_camera.items():
+                logger.info(f"Camera {camera}: {len(recordings)} pending recordings")
             
             # Round-robin processing across all cameras
-            # Process one file from each camera in turn until all are done
             camera_names = list(pending_by_camera.keys())
             camera_indices = {cam: 0 for cam in camera_names}
             
@@ -230,15 +243,12 @@ def monitor_loop():
                 
                 for camera in camera_names:
                     idx = camera_indices[camera]
-                    files = pending_by_camera[camera]
+                    recordings = pending_by_camera[camera]
                     
-                    if idx < len(files):
-                        ts_file = files[idx]
-                        # Double-check it still needs processing (might have been processed by another loop)
-                        json_file = ts_file.with_suffix('.json')
-                        if not json_file.exists():
-                            logger.info(f"[{camera}] Processing file {idx + 1}/{len(files)}")
-                            process_video(ts_file)
+                    if idx < len(recordings):
+                        recording = recordings[idx]
+                        logger.info(f"[{camera}] Processing recording {idx + 1}/{len(recordings)}")
+                        process_recording(recording)
                         camera_indices[camera] = idx + 1
                         processed_any = True
                 
@@ -252,6 +262,11 @@ def monitor_loop():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
+    # Initialize database connection
+    if not db.init_db():
+        logger.error("Failed to connect to database, exiting")
+        exit(1)
+    
     # Wait for vLLM to be ready
     wait_for_vllm()
     
@@ -262,4 +277,3 @@ if __name__ == "__main__":
     # Start FastAPI server
     logger.info(f"Starting HTTP server on port {SERVER_PORT}")
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
-

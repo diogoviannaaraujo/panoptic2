@@ -31,3 +31,21 @@ CREATE TABLE IF NOT EXISTS recordings (
 CREATE INDEX IF NOT EXISTS idx_recordings_stream_id ON recordings(stream_id);
 CREATE INDEX IF NOT EXISTS idx_recordings_recorded_at ON recordings(recorded_at);
 
+-- Create analysis table (references recordings)
+CREATE TABLE IF NOT EXISTS analysis (
+    id SERIAL PRIMARY KEY,
+    recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+    description TEXT,
+    danger BOOLEAN DEFAULT FALSE,
+    danger_level INTEGER DEFAULT 0,
+    danger_details TEXT,
+    raw_response TEXT,
+    error VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Analysis indexes
+CREATE INDEX IF NOT EXISTS idx_analysis_recording_id ON analysis(recording_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_danger ON analysis(danger);
+CREATE INDEX IF NOT EXISTS idx_analysis_danger_level ON analysis(danger_level);
+CREATE INDEX IF NOT EXISTS idx_analysis_created_at ON analysis(created_at);

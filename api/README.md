@@ -1,17 +1,12 @@
 # Panoptic API Service
 
-This is a NestJS-based API service for the Panoptic video surveillance system. It provides endpoints to discover cameras, list recorded events, and stream event playback via HLS.
-
-## Overview
-
-The API scans the recordings directory (mapped from the detector service) and exposes the file structure as a structured API. It dynamically generates HLS playlists (`.m3u8`) to stitch together individual MPEG-TS segments recorded during motion events.
+NestJS API for the Panoptic video surveillance system. Provides endpoints to list cameras, query recordings with AI analysis results, and stream video segments.
 
 ## Getting Started
 
-The service is intended to be run via Docker Compose as part of the main stack.
+Run via Docker Compose from the project root:
 
 ```bash
-# Run via docker-compose from the project root
 docker-compose up -d api
 ```
 
@@ -19,92 +14,207 @@ The API will be available at `http://localhost:3000`.
 
 ### Development
 
-To run locally for development:
-
 ```bash
 cd api
 npm install
 npm run start:dev
 ```
 
-*Note: You will need to set the `RECORDINGS_DIR` environment variable or ensure the default `/recordings` path exists and contains data.*
+### Available Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm run start` | Start the application |
+| `npm run start:dev` | Start with hot-reload for development |
+| `npm run start:debug` | Start with debugger attached |
+| `npm run start:prod` | Start production build |
+| `npm run build` | Build the application |
+| `npm run lint` | Run ESLint with auto-fix |
+| `npm run format` | Format code with Prettier |
 
 ## API Endpoints
 
-### 1. List Cameras
+### List Cameras
 
-Retrieves a list of all available cameras based on the subdirectories found in the recordings folder.
+Returns all cameras with their current state, ordered by name.
 
-- **URL**: `/cameras`
-- **Method**: `GET`
-- **Response**: Array of strings (camera IDs)
-
-**Example Request:**
-```bash
-curl http://localhost:3000/cameras
+```
+GET /cameras
 ```
 
-**Example Response:**
-```json
-[
-  "live_botafogo2_CAM8",
-  "live_camera-test-1"
-]
-```
+**Response:**
 
-### 2. List Events
-
-Retrieves a list of recorded events for a specific camera. An "event" corresponds to a motion detection session.
-
-- **URL**: `/cameras/:camera/events`
-- **Method**: `GET`
-- **Parameters**:
-  - `camera`: The ID of the camera (e.g., `live_botafogo2_CAM8`)
-- **Response**: Array of event objects sorted by timestamp (newest first).
-
-**Example Request:**
-```bash
-curl http://localhost:3000/cameras/live_botafogo2_CAM8/events
-```
-
-**Example Response:**
 ```json
 [
   {
-    "id": "20260115/20260115_093335",
-    "date": "20260115",
-    "timestamp": "20260115_093335",
-    "path": "/recordings/live_botafogo2_CAM8/20260115/20260115_093335"
+    "id": 1,
+    "stream_id": "live_botafogo2_CAM8",
+    "name": "Botafogo Camera 8",
+    "source_type": "rtspSource",
+    "source_url": "rtsp://...",
+    "ready": true,
+    "last_seen_at": "2026-01-15T12:30:00.000Z"
   }
 ]
 ```
 
-### 3. Stream Event (HLS)
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | number | Unique camera identifier |
+| `stream_id` | string | Stream identifier used for recordings |
+| `name` | string \| null | Human-readable camera name |
+| `source_type` | string \| null | Source type (e.g., `rtspSource`) |
+| `source_url` | string \| null | RTSP or source URL |
+| `ready` | boolean | Whether the camera is currently active |
+| `last_seen_at` | string \| null | ISO timestamp of last activity |
 
-Generates an HLS playlist for a specific event. This URL can be fed directly into a video player (VLC, hls.js, etc.).
+---
 
-- **URL**: `/cameras/:camera/events/:date/:timestamp/playlist.m3u8`
-- **Method**: `GET`
-- **Parameters**:
-  - `camera`: Camera ID
-  - `date`: Date string (e.g., `20260115`)
-  - `timestamp`: Event timestamp string (e.g., `20260115_093335`)
-- **Response**: `application/vnd.apple.mpegurl` (M3U8 playlist content)
+### List Recordings
 
-**Example Usage:**
-Open `http://localhost:3000/cameras/live_botafogo2_CAM8/events/20260115/20260115_093335/playlist.m3u8` in a video player.
+Returns paginated recordings for a camera, ordered by date (newest first). Each recording includes its associated AI analysis results if available.
 
-### 4. Get Video Segment
+```
+GET /cameras/:streamId/recordings?page=1&limit=50
+```
 
-Serves individual video segments. These are typically called automatically by the video player based on the playlist.
+**Path Parameters:**
 
-- **URL**: `/cameras/:camera/events/:date/:timestamp/:segment`
-- **Method**: `GET`
-- **Response**: `video/mp2t` (Binary video data)
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | string | The camera's stream identifier |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | number | 1 | Page number (1-indexed) |
+| `limit` | number | 50 | Items per page |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": 123,
+      "stream_id": "live_botafogo2_CAM8",
+      "filename": "live_botafogo2_CAM8_093335.ts",
+      "filepath": "live_botafogo2_CAM8/20260115/20260115_093335/live_botafogo2_CAM8_093335.ts",
+      "recorded_at": "2026-01-15T09:33:35.000Z",
+      "analysis": {
+        "id": 456,
+        "description": "Person walking near entrance",
+        "danger": false,
+        "danger_level": 0,
+        "danger_details": null,
+        "created_at": "2026-01-15T09:34:00.000Z"
+      }
+    }
+  ],
+  "total": 150,
+  "page": 1,
+  "limit": 50
+}
+```
+
+**Recording Object:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | number | Unique recording identifier |
+| `stream_id` | string | Associated camera stream ID |
+| `filename` | string | Recording filename |
+| `filepath` | string | Relative path to the recording file |
+| `recorded_at` | string | ISO timestamp when recorded |
+| `analysis` | object \| null | AI analysis results (see below) |
+
+**Analysis Object** (nullable):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | number | Analysis record identifier |
+| `description` | string \| null | AI-generated description of the scene |
+| `danger` | boolean | Whether a danger was detected |
+| `danger_level` | number | Severity level (0 = none, higher = more severe) |
+| `danger_details` | string \| null | Details about the detected danger |
+| `created_at` | string | ISO timestamp of analysis completion |
+
+---
+
+### Get Recording
+
+Streams a recording segment by ID. Returns the raw video file as a binary stream.
+
+```
+GET /cameras/:streamId/recordings/:id
+```
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | string | The camera's stream identifier |
+| `id` | number | Recording ID |
+
+**Response:**
+
+- Content-Type: `video/mp2t`
+- Body: Binary video stream
+
+**Errors:**
+
+| Status | Description |
+|--------|-------------|
+| 404 | Recording not found or file missing |
+
+## Architecture
+
+```
+src/
+├── main.ts              # Application entry point, CORS enabled
+├── app.module.ts        # Root module definition
+├── app.controller.ts    # REST endpoints
+├── app.service.ts       # Business logic & data access
+└── database.service.ts  # PostgreSQL connection pool
+```
+
+The service uses a connection pool to PostgreSQL with automatic retry logic on startup (up to 10 attempts with 3-second delays).
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RECORDINGS_DIR` | Path to the root directory containing camera recordings | `/recordings` |
+| `RECORDINGS_DIR` | Path to recordings directory | `/recordings` |
+| `DB_HOST` | PostgreSQL host | `localhost` |
+| `DB_PORT` | PostgreSQL port | `5432` |
+| `DB_NAME` | Database name | `panoptic` |
+| `DB_USER` | Database user | `user` |
+| `DB_PASSWORD` | Database password | `password` |
 
+## Docker
+
+The API runs in a Node.js 18 Alpine container. The Dockerfile:
+
+1. Installs dependencies
+2. Builds the TypeScript source
+3. Runs the production build on port 3000
+
+```bash
+# Build manually
+docker build -t panoptic-api .
+
+# Run standalone
+docker run -p 3000:3000 \
+  -e DB_HOST=host.docker.internal \
+  -e RECORDINGS_DIR=/recordings \
+  -v /path/to/recordings:/recordings \
+  panoptic-api
+```
+
+## Tech Stack
+
+- **Runtime:** Node.js 18
+- **Framework:** NestJS 10
+- **Database:** PostgreSQL (via `pg` driver)
+- **Language:** TypeScript 5.1
