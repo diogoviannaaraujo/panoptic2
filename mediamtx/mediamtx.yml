@@ -1,0 +1,36 @@
+# MediaMTX configuration
+# Documentation: https://github.com/bluenviron/mediamtx/blob/main/mediamtx.yml
+
+# Enable RTMP
+rtmp: yes
+rtmpAddress: :1935
+
+# Enable API
+api: yes
+apiAddress: :9997
+
+# Enable Playback API
+playback: yes
+playbackAddress: :9996
+
+# Enable HLS
+hls: yes
+hlsAddress: :8888
+
+# API Authentication (allow anonymous access to API)
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: api
+      - action: playback
+      - action: publish
+      - action: read
+
+# Accept any path name (e.g. /stream, /live/..., etc.)
+# Without this, MediaMTX rejects requests with: "path '<name>' is not configured".
+paths:
+  all:
+    source: publisher

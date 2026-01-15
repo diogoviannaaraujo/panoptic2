@@ -1,0 +1,126 @@
+services:
+  mediamtx:
+    build:
+      context: ./mediamtx
+      dockerfile: Dockerfile
+    container_name: mediamtx
+    ports:
+      - "1935:1935"  # RTMP
+      - "8554:8554"  # RTSP
+      - "8888:8888"  # HLS
+      - "8889:8889"  # WebRTC
+      - "9997:9997"  # API
+      - "9996:9996"  # Playback API
+    restart: unless-stopped
+    depends_on:
+      - db
+
+  detector:
+    build:
+      context: ./detector
+      dockerfile: Dockerfile
+    container_name: detector
+    restart: unless-stopped
+    environment:
+      - MEDIAMTX_HOST=mediamtx
+      - MEDIAMTX_API_PORT=9997
+      - MEDIAMTX_RTSP_PORT=8554
+      - SEGMENT_OUTPUT_DIR=/dev/shm/segments
+      - RECORDINGS_DIR=/recordings
+      - SEGMENT_DURATION=5
+      - MAX_SEGMENTS=20
+      - PRE_ROLL_SECONDS=5
+      - POST_ROLL_SECONDS=5
+      - MOTION_PIXEL_THRESHOLD=25
+      - MOTION_AREA_THRESHOLD=1.0
+      - MOTION_COOLDOWN_FRAMES=30
+      - DISCOVERY_INTERVAL=30
+      - VERBOSE=false
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=panoptic
+      - DB_USER=user
+      - DB_PASSWORD=password
+    volumes:
+      - ./detector:/app
+      - ./recordings:/recordings
+    tmpfs:
+      - /dev/shm:size=512M
+    depends_on:
+      - mediamtx
+      - db
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./recordings:/recordings
+    environment:
+      - RECORDINGS_DIR=/recordings
+    restart: unless-stopped
+    depends_on:
+      - detector
+
+  db:
+    image: postgres:15-alpine
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: panoptic
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  vllm:
+    build:
+      context: ./vllm
+      dockerfile: Dockerfile
+    container_name: vllm
+    runtime: nvidia
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - /home/sunshine-remote/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Qwen/Qwen3-VL-8B-Instruct-FP8 advertises a 262k context; on a 24GB GPU
+    # vLLM cannot allocate enough KV cache for that. Cap max context to fit.
+    # command is now in the Dockerfile
+    restart: unless-stopped
+
+  analyser:
+    build:
+      context: ./analyser
+      dockerfile: Dockerfile
+    container_name: analyser
+    environment:
+      RECORDINGS_DIR: /recordings
+      VLLM_API_URL: http://vllm:8000/v1/chat/completions
+      SERVER_PORT: 8080
+      POLL_INTERVAL: 10
+    volumes:
+      - ./recordings:/recordings
+    ports:
+      - "8080:8080"
+    depends_on:
+      - vllm
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+

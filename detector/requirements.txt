@@ -1,0 +1,8 @@
+# Dependencies are installed via apt in Dockerfile to avoid build issues
+# This file documents the Python packages used:
+#
+# python3-gi       - GStreamer Python bindings (PyGObject)
+# python3-numpy    - Array operations for motion detection
+# python3-requests - HTTP client for MediaMTX API
+#
+# No pip packages required - all installed via system packages
