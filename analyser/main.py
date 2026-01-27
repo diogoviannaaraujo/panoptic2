@@ -112,9 +112,9 @@ def process_recording(recording: dict):
         Provide a structured analysis in JSON format.
         The JSON object must strictly adhere to this schema:
         {
-            "description": "A detailed description of the scene and events",
+            "description": "A detailed description of the events that occurred in the video segment",
             "danger": boolean, // true if there is any danger, threat, or suspicious activity that may require attention
-            "danger_level": number, // the level of the danger between 0 and 10
+            "danger_level": number, // the level of the danger between 0 and 10, 0 means no danger, 10 means life-threatening
             "danger_details": "Details about the danger if any, otherwise empty string"
         }
         
@@ -132,7 +132,7 @@ def process_recording(recording: dict):
                     ]
                 }
             ],
-            "max_tokens": 2048,
+            "max_tokens": 1024,
             "temperature": 0.1
         }
         
@@ -205,55 +205,55 @@ def wait_for_vllm(timeout: int = 300):
     logger.warning(f"vLLM did not become ready after {timeout} seconds, proceeding anyway...")
     return False
 
-def get_pending_by_camera() -> dict[str, list[dict]]:
-    """Get pending recordings grouped by camera (stream_id) for round-robin processing."""
+def get_pending_by_stream() -> dict[str, list[dict]]:
+    """Get pending recordings grouped by stream (stream_id) for round-robin processing."""
     pending = db.get_pending_recordings()
     
-    by_camera = {}
+    by_stream = {}
     for rec in pending:
         stream_id = rec["stream_id"]
-        if stream_id not in by_camera:
-            by_camera[stream_id] = []
-        by_camera[stream_id].append(rec)
+        if stream_id not in by_stream:
+            by_stream[stream_id] = []
+        by_stream[stream_id].append(rec)
     
-    return by_camera
+    return by_stream
 
 def monitor_loop():
     logger.info("Started monitoring database for pending recordings...")
     while True:
         try:
-            # Get pending recordings grouped by camera
-            pending_by_camera = get_pending_by_camera()
+            # Get pending recordings grouped by stream
+            pending_by_stream = get_pending_by_stream()
             
-            if not pending_by_camera:
+            if not pending_by_stream:
                 logger.debug("No pending recordings to process")
                 time.sleep(POLL_INTERVAL)
                 continue
             
             # Log status
-            for camera, recordings in pending_by_camera.items():
-                logger.info(f"Camera {camera}: {len(recordings)} pending recordings")
+            for stream, recordings in pending_by_stream.items():
+                logger.info(f"Stream {stream}: {len(recordings)} pending recordings")
             
-            # Round-robin processing across all cameras
-            camera_names = list(pending_by_camera.keys())
-            camera_indices = {cam: 0 for cam in camera_names}
+            # Round-robin processing across all streams
+            stream_names = list(pending_by_stream.keys())
+            stream_indices = {s: 0 for s in stream_names}
             
             while True:
                 processed_any = False
                 
-                for camera in camera_names:
-                    idx = camera_indices[camera]
-                    recordings = pending_by_camera[camera]
+                for stream in stream_names:
+                    idx = stream_indices[stream]
+                    recordings = pending_by_stream[stream]
                     
                     if idx < len(recordings):
                         recording = recordings[idx]
-                        logger.info(f"[{camera}] Processing recording {idx + 1}/{len(recordings)}")
+                        logger.info(f"[{stream}] Processing recording {idx + 1}/{len(recordings)}")
                         process_recording(recording)
-                        camera_indices[camera] = idx + 1
+                        stream_indices[stream] = idx + 1
                         processed_any = True
                 
                 if not processed_any:
-                    # All cameras exhausted their queues
+                    # All streams exhausted their queues
                     break
                     
         except Exception as e:

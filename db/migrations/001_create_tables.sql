@@ -1,5 +1,5 @@
--- Create cameras table
-CREATE TABLE IF NOT EXISTS cameras (
+-- Create streams table
+CREATE TABLE IF NOT EXISTS streams (
     id SERIAL PRIMARY KEY,
     stream_id VARCHAR(255) NOT NULL UNIQUE,
     name VARCHAR(255),
@@ -13,9 +13,9 @@ CREATE TABLE IF NOT EXISTS cameras (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Camera indexes
-CREATE INDEX IF NOT EXISTS idx_cameras_stream_id ON cameras(stream_id);
-CREATE INDEX IF NOT EXISTS idx_cameras_ready ON cameras(ready);
+-- Stream indexes
+CREATE INDEX IF NOT EXISTS idx_streams_stream_id ON streams(stream_id);
+CREATE INDEX IF NOT EXISTS idx_streams_ready ON streams(ready);
 
 -- Create recordings table
 CREATE TABLE IF NOT EXISTS recordings (
@@ -49,3 +49,20 @@ CREATE INDEX IF NOT EXISTS idx_analysis_recording_id ON analysis(recording_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_danger ON analysis(danger);
 CREATE INDEX IF NOT EXISTS idx_analysis_danger_level ON analysis(danger_level);
 CREATE INDEX IF NOT EXISTS idx_analysis_created_at ON analysis(created_at);
+
+-- Create stream configs table
+CREATE TABLE IF NOT EXISTS detector_configs (
+    id SERIAL PRIMARY KEY,
+    stream_id VARCHAR(255) NOT NULL UNIQUE,
+    enabled BOOLEAN DEFAULT TRUE,
+    crop_x1 INTEGER DEFAULT 0,
+    crop_y1 INTEGER DEFAULT 0,
+    crop_x2 INTEGER DEFAULT 100,
+    crop_y2 INTEGER DEFAULT 100,
+    sensitivity INTEGER DEFAULT 50,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Stream configs indexes
+CREATE INDEX IF NOT EXISTS idx_detector_configs_stream_id ON detector_configs(stream_id);

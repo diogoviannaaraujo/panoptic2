@@ -3,7 +3,7 @@ import { access } from 'fs/promises';
 import { join } from 'path';
 import { DatabaseService } from './database.service';
 
-export interface Camera {
+export interface Stream {
   id: number;
   stream_id: string;
   name: string | null;
@@ -38,16 +38,35 @@ export interface PaginatedResult<T> {
   limit: number;
 }
 
+export interface DetectorConfig {
+  stream_id: string;
+  enabled: boolean;
+  crop_x1: number;
+  crop_y1: number;
+  crop_x2: number;
+  crop_y2: number;
+  sensitivity: number;
+}
+
+export interface UpdateDetectorConfigDto {
+  enabled?: boolean;
+  crop_x1?: number;
+  crop_y1?: number;
+  crop_x2?: number;
+  crop_y2?: number;
+  sensitivity?: number;
+}
+
 @Injectable()
 export class AppService {
   private readonly recordingsDir = process.env.RECORDINGS_DIR || '/recordings';
 
   constructor(private readonly db: DatabaseService) {}
 
-  async getCameras(): Promise<Camera[]> {
-    const { rows } = await this.db.query<Camera>(
+  async getStreams(): Promise<Stream[]> {
+    const { rows } = await this.db.query<Stream>(
       `SELECT id, stream_id, name, source_type, source_url, ready, last_seen_at
-       FROM cameras ORDER BY name NULLS LAST, stream_id`
+       FROM streams ORDER BY name NULLS LAST, stream_id`
     );
     return rows;
   }
@@ -141,5 +160,88 @@ export class AppService {
     }
 
     return filePath;
+  }
+
+  async getDetectorConfig(streamId: string): Promise<DetectorConfig> {
+    const { rows } = await this.db.query<DetectorConfig>(
+      `SELECT stream_id, enabled, crop_x1, crop_y1, crop_x2, crop_y2, sensitivity
+       FROM detector_configs
+       WHERE stream_id = $1`,
+      [streamId]
+    );
+
+    if (!rows.length) {
+      // Return default config if none exists
+      return {
+        stream_id: streamId,
+        enabled: true,
+        crop_x1: 0,
+        crop_y1: 0,
+        crop_x2: 100,
+        crop_y2: 100,
+        sensitivity: 50,
+      };
+    }
+
+    return rows[0];
+  }
+
+  async updateDetectorConfig(
+    streamId: string,
+    update: UpdateDetectorConfigDto,
+  ): Promise<DetectorConfig> {
+    // Validate crop values are within 0-100 range
+    const cropFields = ['crop_x1', 'crop_y1', 'crop_x2', 'crop_y2'] as const;
+    for (const field of cropFields) {
+      if (update[field] !== undefined) {
+        if (update[field] < 0 || update[field] > 100) {
+          throw new Error(`${field} must be between 0 and 100`);
+        }
+      }
+    }
+
+    // Validate x2 > x1 and y2 > y1 if both are provided
+    if (update.crop_x1 !== undefined && update.crop_x2 !== undefined) {
+      if (update.crop_x2 <= update.crop_x1) {
+        throw new Error('crop_x2 must be greater than crop_x1');
+      }
+    }
+    if (update.crop_y1 !== undefined && update.crop_y2 !== undefined) {
+      if (update.crop_y2 <= update.crop_y1) {
+        throw new Error('crop_y2 must be greater than crop_y1');
+      }
+    }
+
+    if (update.sensitivity !== undefined) {
+      if (update.sensitivity < 0 || update.sensitivity > 100) {
+        throw new Error('sensitivity must be between 0 and 100');
+      }
+    }
+
+    // Upsert the config
+    const { rows } = await this.db.query<DetectorConfig>(
+      `INSERT INTO detector_configs (stream_id, enabled, crop_x1, crop_y1, crop_x2, crop_y2, sensitivity)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (stream_id) DO UPDATE SET
+         enabled = COALESCE($2, detector_configs.enabled),
+         crop_x1 = COALESCE($3, detector_configs.crop_x1),
+         crop_y1 = COALESCE($4, detector_configs.crop_y1),
+         crop_x2 = COALESCE($5, detector_configs.crop_x2),
+         crop_y2 = COALESCE($6, detector_configs.crop_y2),
+         sensitivity = COALESCE($7, detector_configs.sensitivity),
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING stream_id, enabled, crop_x1, crop_y1, crop_x2, crop_y2, sensitivity`,
+      [
+        streamId,
+        update.enabled ?? true,
+        update.crop_x1 ?? 0,
+        update.crop_y1 ?? 0,
+        update.crop_x2 ?? 100,
+        update.crop_y2 ?? 100,
+        update.sensitivity ?? 50,
+      ]
+    );
+
+    return rows[0];
   }
 }

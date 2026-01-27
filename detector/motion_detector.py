@@ -14,7 +14,7 @@ Algorithm:
 """
 
 import numpy as np
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 from dataclasses import dataclass
 
 
@@ -52,6 +52,9 @@ class MotionDetector:
         pixel_threshold: int = 25,
         area_threshold: float = 1.0,
         cooldown_frames: int = 30,
+        crop_rect: Optional[Tuple[int, int, int, int]] = None,
+        enabled: bool = True,
+        sensitivity: int = 50,
         on_motion: Optional[Callable[[MotionEvent], None]] = None
     ):
         """
@@ -59,22 +62,64 @@ class MotionDetector:
         
         Args:
             stream_id: Identifier for the stream being monitored
-            pixel_threshold: Minimum pixel difference (0-255) to consider as changed
+            pixel_threshold: Minimum pixel difference (0-255) to consider as changed (overridden if sensitivity changed)
             area_threshold: Minimum percentage of frame that must change (0.0-100.0)
             cooldown_frames: Minimum frames between motion reports
+            crop_rect: Optional crop area (x1, y1, x2, y2)
+            enabled: Whether detection is enabled
+            sensitivity: Motion sensitivity (0-100), where 100 is most sensitive. Overrides pixel_threshold if used.
             on_motion: Callback function when motion is detected
         """
         self.stream_id = stream_id
-        self.pixel_threshold = pixel_threshold
         self.area_threshold = area_threshold
         self.cooldown_frames = cooldown_frames
+        self.crop_rect = crop_rect
+        self.enabled = enabled
+        self.sensitivity = sensitivity
         self.on_motion = on_motion
+        
+        # Calculate pixel threshold from sensitivity
+        # Sensitivity 50 -> threshold 25 (matches old default)
+        # Sensitivity 100 -> threshold 0 (clamped to 5)
+        # Sensitivity 0 -> threshold 50
+        self.pixel_threshold = max(5, int(50 - (sensitivity * 0.5)))
         
         # State
         self._previous_frame: Optional[np.ndarray] = None
         self._frames_since_motion: int = cooldown_frames  # Allow immediate first detection
         self._frame_count: int = 0
     
+    def update_config(self, config: dict):
+        """
+        Update detector configuration dynamically.
+        
+        Args:
+            config: Dictionary containing config updates
+        """
+        if "sensitivity" in config:
+            self.sensitivity = config["sensitivity"]
+            self.pixel_threshold = max(5, int(50 - (self.sensitivity * 0.5)))
+        elif "pixel_threshold" in config:
+             # Fallback if sensitivity not provided but raw threshold is
+            self.pixel_threshold = config["pixel_threshold"]
+            
+        if "area_threshold" in config:
+            self.area_threshold = config["area_threshold"]
+        
+        # Update crop rect
+        if "crop_rect" in config:
+            # If crop changes, reset previous frame to avoid false positives
+            if self.crop_rect != config["crop_rect"]:
+                self.crop_rect = config["crop_rect"]
+                self._previous_frame = None
+        
+        # Update enabled status
+        if "enabled" in config:
+            if self.enabled != config["enabled"]:
+                self.enabled = config["enabled"]
+                if not self.enabled:
+                    self._previous_frame = None
+
     def process_frame(
         self,
         frame_data: bytes,
@@ -98,6 +143,9 @@ class MotionDetector:
         Returns:
             MotionEvent if motion was detected, None otherwise
         """
+        if not self.enabled:
+            return None
+
         self._frame_count += 1
         self._frames_since_motion += 1
         
@@ -108,6 +156,23 @@ class MotionDetector:
             # Frame size mismatch - skip this frame
             return None
         
+        # Apply crop if defined
+        if self.crop_rect:
+            x1, y1, x2, y2 = self.crop_rect
+            # Validate bounds
+            h, w = frame.shape
+            x1 = max(0, min(x1, w))
+            y1 = max(0, min(y1, h))
+            x2 = max(x1, min(x2, w))
+            y2 = max(y1, min(y2, h))
+            
+            # Ensure valid crop area
+            if x2 > x1 and y2 > y1:
+                frame = frame[y1:y2, x1:x2]
+            else:
+                # Invalid crop or zero area, ignore frame
+                return None
+
         # First frame - store and return
         if self._previous_frame is None:
             self._previous_frame = frame.copy()
@@ -123,8 +188,9 @@ class MotionDetector:
         
         # Count pixels that exceed threshold
         changed_pixels = np.sum(diff > self.pixel_threshold)
-        total_pixels = width * height
-        motion_percentage = (changed_pixels / total_pixels) * 100.0
+        # Total pixels is current frame size (cropped or original)
+        total_pixels = frame.size
+        motion_percentage = (changed_pixels / total_pixels) * 100.0 if total_pixels > 0 else 0.0
         
         # Update previous frame for next comparison
         self._previous_frame = frame.copy()

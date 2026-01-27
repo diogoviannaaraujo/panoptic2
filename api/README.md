@@ -1,6 +1,6 @@
 # Panoptic API Service
 
-NestJS API for the Panoptic video surveillance system. Provides endpoints to list cameras, query recordings with AI analysis results, and stream video segments.
+NestJS API for the Panoptic video surveillance system. Provides endpoints to list cameras, query recordings with AI analysis results, stream video segments, and configure motion detection settings.
 
 ## Getting Started
 
@@ -167,6 +167,117 @@ GET /cameras/:streamId/recordings/:id
 | Status | Description |
 |--------|-------------|
 | 404 | Recording not found or file missing |
+
+---
+
+### Get Detector Config
+
+Returns the motion detector configuration for a stream. If no config exists in the database, returns default values (full frame detection, enabled).
+
+```
+GET /streams/:streamId/config
+```
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | string | The camera's stream identifier |
+
+**Response:**
+
+```json
+{
+  "stream_id": "live_botafogo2_CAM8",
+  "enabled": true,
+  "crop_x1": 0,
+  "crop_y1": 0,
+  "crop_x2": 100,
+  "crop_y2": 100
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stream_id` | string | Stream identifier |
+| `enabled` | boolean | Whether motion detection is active |
+| `crop_x1` | number | Left edge of detection area (0-100%) |
+| `crop_y1` | number | Top edge of detection area (0-100%) |
+| `crop_x2` | number | Right edge of detection area (0-100%) |
+| `crop_y2` | number | Bottom edge of detection area (0-100%) |
+
+---
+
+### Update Detector Config
+
+Updates the motion detector configuration for a stream. Creates the config if it doesn't exist (upsert). Changes are picked up by the detector service within a few seconds.
+
+```
+PUT /streams/:streamId/config
+```
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `streamId` | string | The camera's stream identifier |
+
+**Request Body:**
+
+All fields are optional. Only provided fields will be updated.
+
+```json
+{
+  "enabled": true,
+  "crop_x1": 10,
+  "crop_y1": 20,
+  "crop_x2": 90,
+  "crop_y2": 80
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | true | Enable/disable motion detection |
+| `crop_x1` | number | 0 | Left edge of detection area (0-100%) |
+| `crop_y1` | number | 0 | Top edge of detection area (0-100%) |
+| `crop_x2` | number | 100 | Right edge of detection area (0-100%) |
+| `crop_y2` | number | 100 | Bottom edge of detection area (0-100%) |
+
+**Response:**
+
+Returns the updated config object (same format as GET).
+
+**Validation:**
+
+- All crop values must be between 0 and 100
+- `crop_x2` must be greater than `crop_x1`
+- `crop_y2` must be greater than `crop_y1`
+
+**Errors:**
+
+| Status | Description |
+|--------|-------------|
+| 400 | Invalid crop values or validation failed |
+
+**Examples:**
+
+```bash
+# Disable motion detection for a camera
+curl -X PUT http://localhost:3000/streams/live_cam1/config \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# Set detection area to bottom-right quadrant only
+curl -X PUT http://localhost:3000/streams/live_cam1/config \
+  -H "Content-Type: application/json" \
+  -d '{"crop_x1": 50, "crop_y1": 50, "crop_x2": 100, "crop_y2": 100}'
+
+# Reset to full frame detection
+curl -X PUT http://localhost:3000/streams/live_cam1/config \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true, "crop_x1": 0, "crop_y1": 0, "crop_x2": 100, "crop_y2": 100}'
+```
 
 ## Architecture
 

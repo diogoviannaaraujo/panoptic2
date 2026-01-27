@@ -17,7 +17,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Callable, Set, Deque, Tuple
+from typing import Dict, List, Optional, Callable, Set, Deque, Tuple, Any
 from pathlib import Path
 
 import requests
@@ -25,12 +25,12 @@ import requests
 from pipeline import StreamPipeline
 from motion_detector import MotionEvent, default_motion_handler
 from config import config
-from db import init_db, insert_recording, close_connection, upsert_camera, mark_cameras_offline
+from db import init_db, insert_recording, close_connection, upsert_stream, mark_streams_offline, get_detector_config
 
 
 @dataclass
-class CameraInfo:
-    """Represents camera info from MediaMTX API."""
+class StreamInfo:
+    """Represents stream info from MediaMTX API."""
     stream_id: str
     name: str
     ready: bool
@@ -92,6 +92,7 @@ class StreamManager:
         self._discovery_thread: Optional[threading.Thread] = None
         self._cleanup_thread: Optional[threading.Thread] = None
         self._session_thread: Optional[threading.Thread] = None
+        self._config_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
         # Per-stream segment history: recent closed segments for pre-roll
@@ -111,6 +112,63 @@ class StreamManager:
     def _stream_key(stream_id: str) -> str:
         """Convert stream ID to filesystem-safe key."""
         return stream_id.replace("/", "_")
+
+    def _convert_crop_to_pixels(self, crop_rect: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Convert crop rectangle from percentages (0-100) to pixel coordinates.
+        
+        The crop values in the database are stored as percentages of the frame.
+        This converts them to pixel coordinates based on the motion detection
+        resolution (config.motion.detection_width/height).
+        
+        Args:
+            crop_rect: Tuple of (x1, y1, x2, y2) as percentages (0-100)
+            
+        Returns:
+            Tuple of (x1, y1, x2, y2) as pixel coordinates, or None if full frame
+        """
+        x1_pct, y1_pct, x2_pct, y2_pct = crop_rect
+        
+        # If full frame (default), return None to skip cropping entirely
+        if x1_pct == 0 and y1_pct == 0 and x2_pct == 100 and y2_pct == 100:
+            return None
+        
+        width = config.motion.detection_width
+        height = config.motion.detection_height
+        
+        x1 = int((x1_pct / 100.0) * width)
+        y1 = int((y1_pct / 100.0) * height)
+        x2 = int((x2_pct / 100.0) * width)
+        y2 = int((y2_pct / 100.0) * height)
+        
+        return (x1, y1, x2, y2)
+
+    def _prepare_detector_config(self, config_data: Optional[dict]) -> dict:
+        """
+        Prepare detector config by converting crop percentages to pixels.
+        
+        Args:
+            config_data: Raw config from database (crop as percentages)
+            
+        Returns:
+            Config dict ready for motion detector (crop as pixels)
+        """
+        if config_data is None:
+            # No config in DB - return defaults (full frame, enabled)
+            return {"enabled": True, "crop_rect": None, "sensitivity": 50}
+        
+        result: Dict[str, Any] = {"enabled": config_data.get("enabled", True)}
+        
+        crop_rect = config_data.get("crop_rect")
+        if crop_rect:
+            result["crop_rect"] = self._convert_crop_to_pixels(crop_rect)
+        else:
+            result["crop_rect"] = None
+
+        if "sensitivity" in config_data:
+            result["sensitivity"] = config_data["sensitivity"]
+        
+        return result
 
     def _get_history_max_size(self) -> int:
         """Calculate how many segments to keep in history for pre-roll."""
@@ -272,17 +330,17 @@ class StreamManager:
             flush=True
         )
 
-    def discover_streams(self) -> List[CameraInfo]:
+    def discover_streams(self) -> List[StreamInfo]:
         """
         Discover available RTSP streams from MediaMTX API.
         
         Returns:
-            List of CameraInfo objects for streams available on MediaMTX
+            List of StreamInfo objects for streams available on MediaMTX
         """
         # If manual streams are configured, use those instead
         if config.manual_streams:
             return [
-                CameraInfo(stream_id=s, name=s, ready=True)
+                StreamInfo(stream_id=s, name=s, ready=True)
                 for s in config.manual_streams
             ]
         
@@ -292,7 +350,7 @@ class StreamManager:
             
             if response.status_code == 200:
                 data = response.json()
-                cameras = []
+                streams = []
                 
                 # Extract stream info from the API response
                 items = data.get("items", [])
@@ -312,7 +370,7 @@ class StreamManager:
                     bytes_received = item.get("bytesReceived", 0)
                     bytes_sent = item.get("bytesSent", 0)
                     
-                    camera = CameraInfo(
+                    stream = StreamInfo(
                         stream_id=name,
                         name=name,
                         ready=ready,
@@ -321,13 +379,13 @@ class StreamManager:
                         bytes_received=bytes_received,
                         bytes_sent=bytes_sent
                     )
-                    cameras.append(camera)
+                    streams.append(stream)
                 
                 if config.verbose:
-                    ready_streams = [c.stream_id for c in cameras if c.ready]
-                    print(f"[DEBUG] Discovered {len(cameras)} cameras, {len(ready_streams)} ready: {ready_streams}")
+                    ready_streams = [c.stream_id for c in streams if c.ready]
+                    print(f"[DEBUG] Discovered {len(streams)} streams, {len(ready_streams)} ready: {ready_streams}")
                 
-                return cameras
+                return streams
             else:
                 print(f"[WARN] MediaMTX API returned status {response.status_code}")
                 return []
@@ -363,35 +421,43 @@ class StreamManager:
             on_segment_closed=self._handle_segment_closed
         )
         
+        # Apply initial config from database (convert crop percentages to pixels)
+        raw_config = get_detector_config(stream_id)
+        prepared_config = self._prepare_detector_config(raw_config)
+        pipeline.update_config(prepared_config)
+        
+        if config.verbose:
+            print(f"[DEBUG] stream={stream_id} Initial detector config: enabled={prepared_config.get('enabled')}, crop={prepared_config.get('crop_rect')}, sensitivity={prepared_config.get('sensitivity')}")
+        
         return pipeline
     
-    def _update_streams(self, discovered_cameras: List[CameraInfo]):
+    def _update_streams(self, discovered_streams: List[StreamInfo]):
         """
-        Update pipelines based on discovered cameras.
+        Update pipelines based on discovered streams.
         
-        - Upsert all discovered cameras to database
+        - Upsert all discovered streams to database
         - Start pipelines for new ready streams
         - Remove pipelines for streams that are no longer ready
         """
-        # Build lookup of camera info by stream_id
-        camera_lookup = {c.stream_id: c for c in discovered_cameras}
-        ready_stream_ids = {c.stream_id for c in discovered_cameras if c.ready}
-        all_stream_ids = [c.stream_id for c in discovered_cameras]
+        # Build lookup of stream info by stream_id
+        stream_lookup = {c.stream_id: c for c in discovered_streams}
+        ready_stream_ids = {c.stream_id for c in discovered_streams if c.ready}
+        all_stream_ids = [c.stream_id for c in discovered_streams]
         
-        # Update all cameras in database (including non-ready ones)
-        for camera in discovered_cameras:
-            upsert_camera(
-                stream_id=camera.stream_id,
-                name=camera.name,
-                source_type=camera.source_type,
-                source_url=camera.source_url,
-                ready=camera.ready,
-                bytes_received=camera.bytes_received,
-                bytes_sent=camera.bytes_sent
+        # Update all streams in database (including non-ready ones)
+        for stream in discovered_streams:
+            upsert_stream(
+                stream_id=stream.stream_id,
+                name=stream.name,
+                source_type=stream.source_type,
+                source_url=stream.source_url,
+                ready=stream.ready,
+                bytes_received=stream.bytes_received,
+                bytes_sent=stream.bytes_sent
             )
         
-        # Mark cameras not in the discovered list as offline
-        mark_cameras_offline(all_stream_ids)
+        # Mark streams not in the discovered list as offline
+        mark_streams_offline(all_stream_ids)
         
         with self._lock:
             current_streams = set(self._pipelines.keys())
@@ -439,16 +505,48 @@ class StreamManager:
                         print(f"[ERROR] stream={stream_id} Too many errors, removing pipeline")
                         del self._pipelines[stream_id]
     
+    def _update_pipeline_configs(self):
+        """
+        Fetch and apply latest configs for all active pipelines.
+        
+        This method polls the database for detector configs and applies any
+        changes to the motion detectors. Crop values are converted from
+        percentages (as stored in DB) to pixel coordinates.
+        """
+        with self._lock:
+            for stream_id, pipeline in self._pipelines.items():
+                if pipeline.is_running():
+                    try:
+                        raw_config = get_detector_config(stream_id)
+                        prepared_config = self._prepare_detector_config(raw_config)
+                        
+                        # Check if config actually changed before applying
+                        detector = pipeline.motion_detector
+                        old_enabled = detector.enabled
+                        old_crop = detector.crop_rect
+                        old_sensitivity = getattr(detector, "sensitivity", 50)
+                        
+                        new_enabled = prepared_config.get("enabled", True)
+                        new_crop = prepared_config.get("crop_rect")
+                        new_sensitivity = prepared_config.get("sensitivity", 50)
+                        
+                        if old_enabled != new_enabled or old_crop != new_crop or old_sensitivity != new_sensitivity:
+                            pipeline.update_config(prepared_config)
+                            print(f"[CONFIG] stream={stream_id} Updated: enabled={new_enabled}, crop={new_crop}, sensitivity={new_sensitivity} (was: enabled={old_enabled}, crop={old_crop}, sensitivity={old_sensitivity})")
+                        
+                    except Exception as e:
+                        print(f"[WARN] Failed to update config for {stream_id}: {e}")
+
     def _discovery_loop(self):
         """Background thread for stream discovery and health checks."""
         print("[INFO] Stream discovery thread started")
         
         while self._running:
             try:
-                # Discover cameras and update DB/pipelines
-                cameras = self.discover_streams()
-                if cameras:
-                    self._update_streams(cameras)
+                # Discover streams and update DB/pipelines
+                streams = self.discover_streams()
+                if streams:
+                    self._update_streams(streams)
                 
                 # Check pipeline health
                 self._check_pipeline_health()
@@ -463,6 +561,24 @@ class StreamManager:
                 time.sleep(1)
         
         print("[INFO] Stream discovery thread stopped")
+    
+    def _config_loop(self):
+        """Background thread for updating pipeline configurations."""
+        print("[INFO] Config update thread started")
+        
+        while self._running:
+            try:
+                self._update_pipeline_configs()
+            except Exception as e:
+                print(f"[ERROR] Config loop error: {e}")
+            
+            # Check for config updates every 3 seconds
+            for _ in range(3):
+                if not self._running:
+                    break
+                time.sleep(1)
+        
+        print("[INFO] Config update thread stopped")
     
     def _cleanup_old_segments(self):
         """Remove old segment files to prevent tmpfs from filling up."""
@@ -565,6 +681,14 @@ class StreamManager:
             daemon=True
         )
         self._session_thread.start()
+
+        # Start config update thread
+        self._config_thread = threading.Thread(
+            target=self._config_loop,
+            name="ConfigUpdate",
+            daemon=True
+        )
+        self._config_thread.start()
         
         print("[INFO] Stream manager started")
     
@@ -583,6 +707,8 @@ class StreamManager:
             self._cleanup_thread.join(timeout=5)
         if self._session_thread:
             self._session_thread.join(timeout=5)
+        if self._config_thread:
+            self._config_thread.join(timeout=5)
         
         # End any active sessions
         with self._session_lock:
@@ -598,8 +724,8 @@ class StreamManager:
                 pipeline.stop()
             self._pipelines.clear()
         
-        # Mark all cameras as offline before shutting down
-        mark_cameras_offline([])
+        # Mark all streams as offline before shutting down
+        mark_streams_offline([])
         
         # Close database connection
         close_connection()

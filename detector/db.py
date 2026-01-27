@@ -98,7 +98,7 @@ def insert_recording(stream_id: str, filename: str, filepath: str, recorded_at: 
         return False
 
 
-def upsert_camera(
+def upsert_stream(
     stream_id: str,
     name: Optional[str] = None,
     source_type: Optional[str] = None,
@@ -108,11 +108,11 @@ def upsert_camera(
     bytes_sent: int = 0
 ) -> bool:
     """
-    Insert or update a camera record.
+    Insert or update a stream record.
     
     Args:
-        stream_id: Unique identifier for the camera stream
-        name: Optional display name for the camera
+        stream_id: Unique identifier for the stream
+        name: Optional display name for the stream
         source_type: Type of source (e.g., "rtspSource", "webrtcSource")
         source_url: URL of the source stream
         ready: Whether the stream is ready/active
@@ -127,12 +127,12 @@ def upsert_camera(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO cameras (stream_id, name, source_type, source_url, ready, bytes_received, bytes_sent, last_seen_at, updated_at)
+                INSERT INTO streams (stream_id, name, source_type, source_url, ready, bytes_received, bytes_sent, last_seen_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT (stream_id) DO UPDATE SET
-                    name = COALESCE(EXCLUDED.name, cameras.name),
-                    source_type = COALESCE(EXCLUDED.source_type, cameras.source_type),
-                    source_url = COALESCE(EXCLUDED.source_url, cameras.source_url),
+                    name = COALESCE(EXCLUDED.name, streams.name),
+                    source_type = COALESCE(EXCLUDED.source_type, streams.source_type),
+                    source_url = COALESCE(EXCLUDED.source_url, streams.source_url),
                     ready = EXCLUDED.ready,
                     bytes_received = EXCLUDED.bytes_received,
                     bytes_sent = EXCLUDED.bytes_sent,
@@ -143,16 +143,16 @@ def upsert_camera(
             )
         return True
     except Exception as e:
-        print(f"[WARN] Failed to upsert camera: {e}", flush=True)
+        print(f"[WARN] Failed to upsert stream: {e}", flush=True)
         return False
 
 
-def update_camera_status(stream_id: str, ready: bool) -> bool:
+def update_stream_status(stream_id: str, ready: bool) -> bool:
     """
-    Update the ready status of a camera.
+    Update the ready status of a stream.
     
     Args:
-        stream_id: The camera stream identifier
+        stream_id: The stream identifier
         ready: Whether the stream is ready/active
         
     Returns:
@@ -163,7 +163,7 @@ def update_camera_status(stream_id: str, ready: bool) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE cameras 
+                UPDATE streams 
                 SET ready = %s, last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                 WHERE stream_id = %s
                 """,
@@ -171,13 +171,13 @@ def update_camera_status(stream_id: str, ready: bool) -> bool:
             )
         return True
     except Exception as e:
-        print(f"[WARN] Failed to update camera status: {e}", flush=True)
+        print(f"[WARN] Failed to update stream status: {e}", flush=True)
         return False
 
 
-def mark_cameras_offline(active_stream_ids: list) -> bool:
+def mark_streams_offline(active_stream_ids: list) -> bool:
     """
-    Mark cameras as offline (ready=false) if they're not in the active list.
+    Mark streams as offline (ready=false) if they're not in the active list.
     
     Args:
         active_stream_ids: List of currently active stream IDs
@@ -189,10 +189,10 @@ def mark_cameras_offline(active_stream_ids: list) -> bool:
         conn = get_connection()
         with conn.cursor() as cur:
             if active_stream_ids:
-                # Mark cameras not in the list as offline
+                # Mark streams not in the list as offline
                 cur.execute(
                     """
-                    UPDATE cameras 
+                    UPDATE streams 
                     SET ready = FALSE, updated_at = CURRENT_TIMESTAMP
                     WHERE ready = TRUE AND stream_id != ALL(%s)
                     """,
@@ -202,15 +202,50 @@ def mark_cameras_offline(active_stream_ids: list) -> bool:
                 # No active streams, mark all as offline
                 cur.execute(
                     """
-                    UPDATE cameras 
+                    UPDATE streams 
                     SET ready = FALSE, updated_at = CURRENT_TIMESTAMP
                     WHERE ready = TRUE
                     """
                 )
         return True
     except Exception as e:
-        print(f"[WARN] Failed to mark cameras offline: {e}", flush=True)
+        print(f"[WARN] Failed to mark streams offline: {e}", flush=True)
         return False
+
+
+def get_detector_config(stream_id: str) -> Optional[dict]:
+    """
+    Get detector configuration for a stream.
+    
+    Args:
+        stream_id: The stream identifier
+        
+    Returns:
+        Dictionary with config values or None if not found
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT enabled, crop_x1, crop_y1, crop_x2, crop_y2, sensitivity
+                FROM detector_configs
+                WHERE stream_id = %s
+                """,
+                (stream_id,)
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "enabled": row[0],
+                    "crop_rect": (row[1], row[2], row[3], row[4]),
+                    "sensitivity": row[5]
+                }
+            return None
+    except Exception as e:
+        print(f"[WARN] Failed to get detector config: {e}", flush=True)
+        return None
+
 
 
 def close_connection():
@@ -219,4 +254,3 @@ def close_connection():
     if _connection and not _connection.closed:
         _connection.close()
         _connection = None
-

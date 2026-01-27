@@ -1,23 +1,33 @@
 import {
+  BadRequestException,
+  Body,
   Controller,
   Get,
   Param,
   ParseIntPipe,
+  Put,
   Query,
   Res,
   StreamableFile,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { createReadStream } from 'fs';
-import { AppService, Camera, PaginatedResult, Recording } from './app.service';
+import {
+  AppService,
+  Stream,
+  PaginatedResult,
+  Recording,
+  DetectorConfig,
+  UpdateDetectorConfigDto,
+} from './app.service';
 
-@Controller('cameras')
+@Controller('streams')
 export class AppController {
   constructor(private readonly appService: AppService) {}
 
   @Get()
-  getCameras(): Promise<Camera[]> {
-    return this.appService.getCameras();
+  getStreams(): Promise<Stream[]> {
+    return this.appService.getStreams();
   }
 
   @Get(':streamId/recordings')
@@ -43,5 +53,24 @@ export class AppController {
     });
 
     return new StreamableFile(createReadStream(filePath));
+  }
+
+  @Get(':streamId/config')
+  getDetectorConfig(
+    @Param('streamId') streamId: string,
+  ): Promise<DetectorConfig> {
+    return this.appService.getDetectorConfig(streamId);
+  }
+
+  @Put(':streamId/config')
+  async updateDetectorConfig(
+    @Param('streamId') streamId: string,
+    @Body() body: UpdateDetectorConfigDto,
+  ): Promise<DetectorConfig> {
+    try {
+      return await this.appService.updateDetectorConfig(streamId, body);
+    } catch (error) {
+      throw new BadRequestException(error.message);
+    }
   }
 }

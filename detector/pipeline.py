@@ -412,6 +412,18 @@ class StreamPipeline:
         """Check if pipeline is currently running."""
         return self._running
     
+    def update_config(self, config: dict):
+        """
+        Update pipeline configuration (specifically motion detector).
+        
+        Args:
+            config: Dictionary containing config updates
+        """
+        if self.motion_detector:
+            self.motion_detector.update_config(config)
+            if config.get("verbose", False):
+                print(f"[INFO] stream={self.stream_id} Updated config: {config}")
+
     @property
     def current_segment(self) -> str:
         """Get the current segment file path."""
